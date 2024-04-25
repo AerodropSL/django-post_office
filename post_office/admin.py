@@ -15,11 +15,17 @@ from django.urls import re_path, reverse
 from django.utils.html import format_html
 from django.utils.text import Truncator
 from django.utils.translation import gettext_lazy as _
+from swapper import load_model
 
 from .fields import CommaSeparatedEmailField
 from .mail import send
-from .models import STATUS, Attachment, Email, EmailTemplate, Log
+from .models import STATUS
 from .sanitizer import clean_html
+
+Email = load_model('post_office', 'Email')
+EmailTemplate = load_model('post_office', 'EmailTemplate')
+Attachment = load_model('post_office', 'Attachment')
+Log = load_model('post_office', 'Log')
 
 
 def get_message_preview(instance):

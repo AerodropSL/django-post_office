@@ -11,10 +11,12 @@ from multiprocessing import Pool, TimeoutError
 from multiprocessing.context import TimeoutError as ContextTimeoutError
 from multiprocessing.dummy import Pool as ThreadPool
 
+from swapper import load_model
+
 from .connections import connections
 from .lockfile import default_lockfile, FileLock, FileLocked
 from .logutils import setup_loghandlers
-from .models import Email, EmailTemplate, Log, PRIORITY, STATUS
+from .models import PRIORITY, STATUS
 from .settings import (
     get_available_backends,
     get_batch_delivery_timeout,
@@ -56,11 +58,13 @@ def create(
     render_on_delivery=False,
     commit=True,
     backend="",
+    **kwargs,
 ):
     """
     Creates an email from supplied keyword arguments. If template is
     specified, email subject and content will be rendered during delivery.
     """
+    Email = load_model('post_office', 'Email')
     priority = parse_priority(priority)
     status = None if priority == PRIORITY.now else STATUS.queued
 
@@ -93,6 +97,7 @@ def create(
             context=context,
             template=template,
             backend_alias=backend,
+            **kwargs,
         )
 
     else:
@@ -122,6 +127,7 @@ def create(
             status=status,
             backend_alias=backend,
             template=template,
+            **kwargs,
         )
 
     if commit:
@@ -150,6 +156,7 @@ def send(
     bcc=None,
     language="",
     backend="",
+    **kwargs,
 ):
     try:
         recipients = parse_emails(recipients)
@@ -195,7 +202,7 @@ def send(
             )
 
         # template can be an EmailTemplate instance or name
-        if isinstance(template, EmailTemplate):
+        if isinstance(template, load_model('post_office', 'EmailTemplate')):
             template = template
             # If language is specified, ensure template uses the right language
             if language and template.language != language:
@@ -223,6 +230,7 @@ def send(
         render_on_delivery,
         commit=commit,
         backend=backend,
+        **kwargs,
     )
 
     if attachments:
@@ -231,6 +239,7 @@ def send(
 
     if priority == PRIORITY.now:
         email.dispatch(log_level=log_level)
+    Email = load_model('post_office', 'Email')
     email_queued.send(sender=Email, emails=[email])
 
     return email
@@ -242,6 +251,7 @@ def send_many(kwargs_list):
     Internally, it uses Django's bulk_create command for efficiency reasons.
     Currently send_many() can't be used to send emails with priority = 'now'.
     """
+    Email = load_model('post_office', 'Email')
     emails = [send(commit=False, **kwargs) for kwargs in kwargs_list]
     if emails:
         Email.objects.bulk_create(emails)
@@ -255,6 +265,7 @@ def get_queued():
      - Has scheduled_time before the current time or is None
      - Has expires_at after the current time or is None
     """
+    Email = load_model('post_office', 'Email')
     now = timezone.now()
     query = (Q(scheduled_time__lte=now) | Q(scheduled_time=None)) & (
         Q(expires_at__gt=now) | Q(expires_at=None)
@@ -399,6 +410,9 @@ def _send_bulk(emails, uses_multiprocessing=True, log_level=None):
     pool.join()
 
     connections.close()
+
+    Email = load_model('post_office', 'Email')
+    Log = load_model('post_office', 'Log')
 
     # Update statuses of sent emails
     email_ids = [email.id for email in sent_emails]

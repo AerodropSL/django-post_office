@@ -1,3 +1,4 @@
+import swapper
 from django.db import models, migrations
 
 import post_office.fields
@@ -19,6 +20,7 @@ class Migration(migrations.Migration):
                 ('name', models.CharField(help_text='The original filename', max_length=255)),
             ],
             options={
+                'swappable': swapper.swappable_setting('post_office', 'Attachment'),
             },
             bases=(models.Model,),
         ),
@@ -42,6 +44,7 @@ class Migration(migrations.Migration):
                 ('context', models.JSONField(null=True, blank=True)),
             ],
             options={
+                'swappable': swapper.swappable_setting('post_office', 'Email'),
             },
             bases=(models.Model,),
         ),
@@ -58,6 +61,7 @@ class Migration(migrations.Migration):
                 ('last_updated', models.DateTimeField(auto_now=True)),
             ],
             options={
+                'swappable': swapper.swappable_setting('post_office', 'EmailTemplate'),
             },
             bases=(models.Model,),
         ),
@@ -69,22 +73,23 @@ class Migration(migrations.Migration):
                 ('status', models.PositiveSmallIntegerField(choices=[(0, 'sent'), (1, 'failed')])),
                 ('exception_type', models.CharField(max_length=255, blank=True)),
                 ('message', models.TextField()),
-                ('email', models.ForeignKey(related_name='logs', editable=False, on_delete=models.deletion.CASCADE, to='post_office.Email', )),
+                ('email', models.ForeignKey(related_name='logs', editable=False, on_delete=models.deletion.CASCADE, to=swapper.get_model_name('post_office', 'Email'), )),
             ],
             options={
+                'swappable': swapper.swappable_setting('post_office', 'Log'),
             },
             bases=(models.Model,),
         ),
         migrations.AddField(
             model_name='email',
             name='template',
-            field=models.ForeignKey(blank=True, on_delete=models.deletion.SET_NULL, to='post_office.EmailTemplate', null=True),
+            field=models.ForeignKey(blank=True, on_delete=models.deletion.SET_NULL, to=swapper.get_model_name('post_office', 'EmailTemplate'), null=True),
             preserve_default=True,
         ),
         migrations.AddField(
             model_name='attachment',
             name='emails',
-            field=models.ManyToManyField(related_name='attachments', to='post_office.Email'),
+            field=models.ManyToManyField(related_name='attachments', to=swapper.get_model_name('post_office', 'Email')),
             preserve_default=True,
         ),
     ]

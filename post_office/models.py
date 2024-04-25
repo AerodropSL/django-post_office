@@ -4,6 +4,7 @@ from collections import namedtuple
 from uuid import uuid4
 from email.mime.nonmultipart import MIMENonMultipart
 
+import swapper
 from django.core.exceptions import ValidationError
 from django.core.mail import EmailMessage, EmailMultiAlternatives
 from django.db import models
@@ -27,7 +28,7 @@ PRIORITY = namedtuple('PRIORITY', 'low medium high now')._make(range(4))
 STATUS = namedtuple('STATUS', 'sent failed queued requeued')._make(range(4))
 
 
-class Email(models.Model):
+class AbstractEmail(models.Model):
     """
     A model to hold email information.
     """
@@ -68,7 +69,7 @@ class Email(models.Model):
     message_id = models.CharField("Message-ID", null=True, max_length=255, editable=False)
     number_of_retries = models.PositiveIntegerField(null=True, blank=True)
     headers = models.JSONField(_('Headers'), blank=True, null=True)
-    template = models.ForeignKey('post_office.EmailTemplate', blank=True,
+    template = models.ForeignKey(swapper.get_model_name('post_office', 'EmailTemplate'), blank=True,
                                  null=True, verbose_name=_("Email template"),
                                  on_delete=models.CASCADE)
     context = context_field_class(_('Context'), blank=True, null=True)
@@ -76,6 +77,7 @@ class Email(models.Model):
                                      max_length=64)
 
     class Meta:
+        abstract = True
         app_label = 'post_office'
         verbose_name = pgettext_lazy("Email address", "Email")
         verbose_name_plural = pgettext_lazy("Email addresses", "Emails")
@@ -95,6 +97,9 @@ class Email(models.Model):
             return self._cached_email_message
 
         return self.prepare_email_message()
+
+    def get_connection(self):
+        return connections[self.backend_alias or 'default']
 
     def prepare_email_message(self):
         """
@@ -117,7 +122,7 @@ class Email(models.Model):
             multipart_template = None
             html_message = self.html_message
 
-        connection = connections[self.backend_alias or 'default']
+        connection = self.get_connection()
         if isinstance(self.headers, dict) or self.expires_at or self.message_id:
             headers = dict(self.headers or {})
             if self.expires_at:
@@ -219,14 +224,14 @@ class Email(models.Model):
         return super().save(*args, **kwargs)
 
 
-class Log(models.Model):
+class AbstractLog(models.Model):
     """
     A model to record sending email sending activities.
     """
 
     STATUS_CHOICES = [(STATUS.sent, _("sent")), (STATUS.failed, _("failed"))]
 
-    email = models.ForeignKey(Email, editable=False, related_name='logs',
+    email = models.ForeignKey(swapper.get_model_name('post_office', 'Email'), editable=False, related_name='logs',
                               verbose_name=_('Email address'), on_delete=models.CASCADE)
     date = models.DateTimeField(auto_now_add=True)
     status = models.PositiveSmallIntegerField(_('Status'), choices=STATUS_CHOICES)
@@ -234,6 +239,7 @@ class Log(models.Model):
     message = models.TextField(_('Message'))
 
     class Meta:
+        abstract = True
         app_label = 'post_office'
         verbose_name = _("Log")
         verbose_name_plural = _("Logs")
@@ -247,7 +253,7 @@ class EmailTemplateManager(models.Manager):
         return self.get(name=name, language=language, default_template=default_template)
 
 
-class EmailTemplate(models.Model):
+class AbstractEmailTemplate(models.Model):
     """
     Model to hold template information from db
     """
@@ -266,12 +272,13 @@ class EmailTemplate(models.Model):
         verbose_name=_("Language"),
         help_text=_("Render template in alternative language"),
         default='', blank=True)
-    default_template = models.ForeignKey('self', related_name='translated_templates',
+    default_template = models.ForeignKey(swapper.get_model_name('post_office', 'EmailTemplate'), related_name='translated_templates',
         null=True, default=None, verbose_name=_('Default template'), on_delete=models.CASCADE)
 
     objects = EmailTemplateManager()
 
     class Meta:
+        abstract = True
         app_label = 'post_office'
         unique_together = ('name', 'language', 'default_template')
         verbose_name = _("Email Template")
@@ -306,21 +313,42 @@ def get_upload_path(instance, filename):
                         str(date.month), str(date.day), filename)
 
 
-class Attachment(models.Model):
+class AbstractAttachment(models.Model):
     """
     A model describing an email attachment.
     """
     file = models.FileField(_('File'), upload_to=get_upload_path)
     name = models.CharField(_('Name'), max_length=255, help_text=_("The original filename"))
-    emails = models.ManyToManyField(Email, related_name='attachments',
+    emails = models.ManyToManyField(swapper.get_model_name('post_office', 'Email'), related_name='attachments',
                                     verbose_name=_('Emails'))
     mimetype = models.CharField(max_length=255, default='', blank=True)
     headers = models.JSONField(_('Headers'), blank=True, null=True)
 
     class Meta:
+        abstract = True
         app_label = 'post_office'
         verbose_name = _("Attachment")
         verbose_name_plural = _("Attachments")
 
     def __str__(self):
         return self.name
+
+
+class Email(AbstractEmail):
+    class Meta(AbstractEmail.Meta):
+        swappable = swapper.swappable_setting('post_office', 'Email')
+
+
+class Log(AbstractLog):
+    class Meta(AbstractLog.Meta):
+        swappable = swapper.swappable_setting('post_office', 'Log')
+
+
+class EmailTemplate(AbstractEmailTemplate):
+    class Meta(AbstractEmailTemplate.Meta):
+        swappable = swapper.swappable_setting('post_office', 'EmailTemplate')
+
+
+class Attachment(AbstractAttachment):
+    class Meta(AbstractAttachment.Meta):
+        swappable = swapper.swappable_setting('post_office', 'Attachment')

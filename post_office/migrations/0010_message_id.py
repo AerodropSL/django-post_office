@@ -3,13 +3,14 @@ from django.db import migrations, models
 
 from post_office.models import STATUS
 from post_office.settings import get_message_id_enabled, get_message_id_fqdn
+from swapper import load_model
 
 
 def forwards(apps, schema_editor):
     if not get_message_id_enabled():
         return
     msg_id_fqdn = get_message_id_fqdn()
-    Email = apps.get_model('post_office', 'Email')
+    Email = load_model('post_office', 'Email')
     for email in Email.objects.using(schema_editor.connection.alias).filter(message_id__isnull=True):
         if email.status in [STATUS.queued, STATUS.requeued]:
             # create a unique Message-ID for all emails which have not been send yet

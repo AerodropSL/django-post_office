@@ -4,7 +4,9 @@ from django.core.files import File
 from django.utils.encoding import force_str
 
 from post_office import cache
-from .models import Email, PRIORITY, STATUS, EmailTemplate, Attachment
+from swapper import load_model
+
+from .models import PRIORITY, STATUS
 from .settings import get_default_priority
 from .validators import validate_email_with_name
 
@@ -15,6 +17,7 @@ def send_mail(subject, message, from_email, recipient_list, html_message='',
     Add a new message to the mail queue. This is a replacement for Django's
     ``send_mail`` core email method.
     """
+    Email = load_model('post_office', 'Email')
 
     subject = force_str(subject)
     status = None if priority == PRIORITY.now else STATUS.queued
@@ -35,6 +38,8 @@ def get_email_template(name, language=''):
     """
     Function that returns an email template instance, from cache or DB.
     """
+    EmailTemplate = load_model('post_office', 'EmailTemplate')
+
     use_cache = getattr(settings, 'POST_OFFICE_CACHE', True)
     if use_cache:
         use_cache = getattr(settings, 'POST_OFFICE_TEMPLATE_CACHE', True)
@@ -71,6 +76,8 @@ def create_attachments(attachment_files):
 
     Returns a list of Attachment objects
     """
+    Attachment = load_model('post_office', 'Attachment')
+
     attachments = []
     for filename, filedata in attachment_files.items():
 
@@ -146,6 +153,9 @@ def cleanup_expired_mails(cutoff_date, delete_attachments=True, batch_size=1000)
     Optionally also delete pending attachments.
     Return the number of deleted emails and attachments.
     """
+    Email = load_model('post_office', 'Email')
+    Attachment = load_model('post_office', 'Attachment')
+
     total_deleted_emails = 0
 
     while True:

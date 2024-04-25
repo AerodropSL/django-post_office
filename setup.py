@@ -51,6 +51,7 @@ setup(
         'bleach[css]',
         'django>=3.2',
         'pytz',
+        'swapper',
     ],
     classifiers=[
         'Development Status :: 5 - Production/Stable',

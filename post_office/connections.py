@@ -15,9 +15,12 @@ class ConnectionHandler:
     def __init__(self):
         self._connections = local()
 
-    def __getitem__(self, alias):
+    def get(self, alias, key=None, **kwargs):
+        if key is None:
+            key = alias
+
         try:
-            return self._connections.connections[alias]
+            return self._connections.connections[key]
         except AttributeError:
             self._connections.connections = {}
         except KeyError:
@@ -28,9 +31,9 @@ class ConnectionHandler:
         except KeyError:
             raise KeyError('%s is not a valid backend alias' % alias)
 
-        connection = get_connection(backend)
+        connection = get_connection(backend, **kwargs)
         connection.open()
-        self._connections.connections[alias] = connection
+        self._connections.connections[key] = connection
         return connection
 
     def all(self):
