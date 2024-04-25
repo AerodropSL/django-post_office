@@ -42,6 +42,9 @@ class ConnectionHandler:
     def close(self):
         for connection in self.all():
             connection.close()
+        # We need to clean up connections, so they are recreated as config might have changed
+        if hasattr(self._connections, 'connections'):
+            self._connections.connections = {}
 
 
 connections = ConnectionHandler()
