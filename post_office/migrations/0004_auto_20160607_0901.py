@@ -7,7 +7,6 @@ import post_office.models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('post_office', '0003_longer_subject'),
     ]
@@ -58,7 +57,12 @@ class Migration(migrations.Migration):
         migrations.AlterField(
             model_name='email',
             name='priority',
-            field=models.PositiveSmallIntegerField(blank=True, choices=[(0, 'low'), (1, 'medium'), (2, 'high'), (3, 'now')], null=True, verbose_name='Priority'),
+            field=models.PositiveSmallIntegerField(
+                blank=True,
+                choices=[(0, 'low'), (1, 'medium'), (2, 'high'), (3, 'now')],
+                null=True,
+                verbose_name='Priority',
+            ),
         ),
         migrations.AlterField(
             model_name='email',
@@ -68,7 +72,13 @@ class Migration(migrations.Migration):
         migrations.AlterField(
             model_name='email',
             name='status',
-            field=models.PositiveSmallIntegerField(blank=True, choices=[(0, 'sent'), (1, 'failed'), (2, 'queued')], db_index=True, null=True, verbose_name='Status'),
+            field=models.PositiveSmallIntegerField(
+                blank=True,
+                choices=[(0, 'sent'), (1, 'failed'), (2, 'queued')],
+                db_index=True,
+                null=True,
+                verbose_name='Status',
+            ),
         ),
         migrations.AlterField(
             model_name='email',
@@ -88,7 +98,13 @@ class Migration(migrations.Migration):
         migrations.AlterField(
             model_name='emailtemplate',
             name='language',
-            field=models.CharField(blank=True, default='', help_text='Render template in alternative language', max_length=12, verbose_name='Language'),
+            field=models.CharField(
+                blank=True,
+                default='',
+                help_text='Render template in alternative language',
+                max_length=12,
+                verbose_name='Language',
+            ),
         ),
         migrations.AlterField(
             model_name='emailtemplate',
