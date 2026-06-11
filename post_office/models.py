@@ -17,7 +17,7 @@ from post_office.fields import CommaSeparatedEmailField
 
 from .connections import connections
 from .logutils import setup_loghandlers
-from .settings import context_field_class, get_log_level, get_template_engine, get_override_recipients
+from .settings import context_field_class, get_file_storage, get_log_level, get_template_engine, get_override_recipients
 from .validators import validate_email_with_name, validate_template_syntax
 
 
@@ -26,6 +26,21 @@ logger = setup_loghandlers('INFO')
 
 PRIORITY = namedtuple('PRIORITY', 'low medium high now')._make(range(4))
 STATUS = namedtuple('STATUS', 'sent failed queued requeued')._make(range(4))
+
+
+class RecipientDeliveryStatus(models.IntegerChoices):
+    ACCEPTED = 10, _('Accepted')
+    DELIVERED = 20, _('Delivered')
+    OPENED = 30, _('Opened')
+    CLICKED = 40, _('Clicked')
+
+    DEFERRED = 50, _('Deferred')
+    SOFT_BOUNCED = 60, _('Soft Bounced')
+    UNDETERMINED_BOUNCED = 65, _('Undetermined Bounced')
+    HARD_BOUNCED = 70, _('Hard Bounced')
+
+    SPAM_COMPLAINT = 80, _('Spam Complaint')
+    UNSUBSCRIBED = 90, _('Unsubscribed')
 
 
 class AbstractEmail(models.Model):
@@ -59,6 +74,9 @@ class AbstractEmail(models.Model):
     whether it's successfully delivered.
     """
     status = models.PositiveSmallIntegerField(_('Status'), choices=STATUS_CHOICES, db_index=True, blank=True, null=True)
+    recipient_delivery_status = models.PositiveSmallIntegerField(
+        _('Recipient Delivery Status'), choices=RecipientDeliveryStatus.choices, blank=True, null=True
+    )
     priority = models.PositiveSmallIntegerField(_('Priority'), choices=PRIORITY_CHOICES, blank=True, null=True)
     created = models.DateTimeField(auto_now_add=True, db_index=True)
     last_updated = models.DateTimeField(db_index=True, auto_now=True)
@@ -88,8 +106,11 @@ class AbstractEmail(models.Model):
         super().__init__(*args, **kwargs)
         self._cached_email_message = None
 
+    def __repr__(self):
+        return f'<{self.__class__.__name__}: {self.to}>'
+
     def __str__(self):
-        return '%s' % self.to
+        return f'{", ".join(self.to)}'
 
     def email_message(self):
         """
@@ -191,12 +212,20 @@ class AbstractEmail(models.Model):
         self._cached_email_message = msg
         return msg
 
-    def dispatch(self, log_level=None, disconnect_after_delivery=True, commit=True):
+    def dispatch(self, log_level=None, disconnect_after_delivery=True, commit=True, connection=None):
         """
         Sends email and log the result.
+
+        If ``connection`` is provided, it overrides the connection embedded in
+        the email message by ``prepare_email_message()``. This allows callers
+        (e.g. worker threads) to supply a thread-local connection rather than
+        reusing one that was opened in a different thread.
         """
         try:
-            self.email_message().send()
+            msg = self.email_message()
+            if connection is not None:
+                msg.connection = connection
+            msg.send()
             status = STATUS.sent
             message = ''
             exception_type = ''
@@ -246,7 +275,7 @@ class AbstractLog(models.Model):
     A model to record sending email sending activities.
     """
 
-    STATUS_CHOICES = [(STATUS.sent, _('sent')), (STATUS.failed, _('failed'))]
+    STATUS_CHOICES = [(STATUS.sent, _('sent')), (STATUS.failed, _('failed'))] + RecipientDeliveryStatus.choices
 
     email = models.ForeignKey(
         swapper.get_model_name('post_office', 'Email'), editable=False, related_name='logs',
@@ -313,7 +342,7 @@ class AbstractEmailTemplate(models.Model):
         ordering = ['name']
 
     def __str__(self):
-        return '%s %s' % (self.name, self.language)
+        return f'{self.name} {self.language}'
 
     def natural_key(self):
         return (self.name, self.language, self.default_template)
@@ -343,7 +372,7 @@ class AbstractAttachment(models.Model):
     A model describing an email attachment.
     """
 
-    file = models.FileField(_('File'), upload_to=get_upload_path)
+    file = models.FileField(_('File'), storage=get_file_storage, upload_to=get_upload_path)
     name = models.CharField(_('Name'), max_length=255, help_text=_('The original filename'))
     emails = models.ManyToManyField(
         swapper.get_model_name('post_office', 'Email'), related_name='attachments', verbose_name=_('Emails'),

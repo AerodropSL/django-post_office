@@ -1,19 +1,22 @@
+import multiprocessing
+from collections.abc import Sequence
+from email.utils import make_msgid
+from multiprocessing.dummy import Pool as ThreadPool
+from typing import Any, Optional
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import connection as db_connection
-from django.db.models import Q
+from django.db.models import Q, QuerySet
 from django.template import Context, Template
 from django.utils import timezone
-from email.utils import make_msgid
-from multiprocessing import Pool
-from multiprocessing.dummy import Pool as ThreadPool
 
 from swapper import load_model
 
 from .connections import connections
-from .lockfile import default_lockfile, FileLock, FileLocked
+from .lockfile import FileLock, FileLocked, default_lockfile
 from .logutils import setup_loghandlers
-from .models import PRIORITY, STATUS
+from .models import PRIORITY, STATUS, Email, EmailTemplate, Log
 from .settings import (
     get_available_backends,
     get_batch_delivery_timeout,
@@ -36,6 +39,17 @@ from .utils import (
 )
 
 logger = setup_loghandlers('INFO')
+
+
+def _send_email(email: Email, log_level: int) -> tuple[bool, Optional[Exception]]:
+    try:
+        connection = connections[email.backend_alias or 'default']
+        email.dispatch(log_level=log_level, commit=False, disconnect_after_delivery=False, connection=connection)
+        logger.debug(f'Successfully sent email #{email.id}')
+        return True, None
+    except Exception as e:
+        logger.exception(f'Failed to send email #{email.id}')
+        return False, e
 
 
 def create(
@@ -156,17 +170,17 @@ def send(
     try:
         recipients = parse_emails(recipients)
     except ValidationError as e:
-        raise ValidationError('recipients: %s' % e.message)
+        raise ValidationError(f'recipients: {e.message}')
 
     try:
         cc = parse_emails(cc)
     except ValidationError as e:
-        raise ValidationError('c: %s' % e.message)
+        raise ValidationError(f'c: {e.message}')
 
     try:
         bcc = parse_emails(bcc)
     except ValidationError as e:
-        raise ValidationError('bcc: %s' % e.message)
+        raise ValidationError(f'bcc: {e.message}')
 
     if sender is None:
         sender = settings.DEFAULT_FROM_EMAIL
@@ -200,7 +214,7 @@ def send(
             template = get_email_template(template, language)
 
     if backend and backend not in get_available_backends().keys():
-        raise ValueError('%s is not a valid backend alias' % backend)
+        raise ValueError(f'{backend} is not a valid backend alias')
 
     email = create(
         sender,
@@ -235,7 +249,7 @@ def send(
     return email
 
 
-def send_many(kwargs_list):
+def send_many(kwargs_list: list[dict[str, Any]]) -> list[Email]:
     """
     Similar to mail.send(), but this function accepts a list of kwargs.
     Internally, it uses Django's bulk_create command for efficiency reasons.
@@ -247,8 +261,10 @@ def send_many(kwargs_list):
         Email.objects.bulk_create(emails)
         email_queued.send(sender=Email, emails=emails)
 
+    return emails
 
-def get_queued():
+
+def get_queued() -> QuerySet[Email]:
     """
     Returns the queryset of emails eligible for sending – fulfilling these conditions:
      - Status is queued or requeued
@@ -260,21 +276,40 @@ def get_queued():
     query = (Q(scheduled_time__lte=now) | Q(scheduled_time=None)) & (Q(expires_at__gt=now) | Q(expires_at=None))
     return (
         Email.objects.filter(query, status__in=[STATUS.queued, STATUS.requeued])
-        .select_related('template')
         .order_by(*get_sending_order())
         .prefetch_related('attachments')[: get_batch_size()]
     )
 
 
-def send_queued(processes=1, log_level=None):
+def attach_templates(emails: list[Email]) -> None:
+    """
+    Efficiently attach template objects to emails using a single query
+    for all unique templates instead of loading duplicates.
+    """
+    template_ids = {email.template_id for email in emails if email.template_id is not None}
+
+    if not template_ids:
+        return
+
+    EmailTemplate = load_model('post_office', 'EmailTemplate')
+    templates = EmailTemplate.objects.filter(id__in=template_ids)
+    template_map = {template.id: template for template in templates}
+
+    for email in emails:
+        if email.template_id is not None:
+            email.template = template_map.get(email.template_id)
+
+
+def send_queued(processes: int = 1, log_level: Optional[int] = None) -> tuple[int, int, int]:
     """
     Sends out all queued mails that has scheduled_time less than now or None
     """
-    queued_emails = get_queued()
+    queued_emails = list(get_queued())
+    attach_templates(queued_emails)
     total_sent, total_failed, total_requeued = 0, 0, 0
     total_email = len(queued_emails)
 
-    logger.info('Started sending %s emails with %s processes.' % (total_email, processes))
+    logger.info(f'Started sending {total_email} emails with {processes} processes.')
 
     if log_level is None:
         log_level = get_log_level()
@@ -293,34 +328,25 @@ def send_queued(processes=1, log_level=None):
         else:
             email_lists = split_emails(queued_emails, processes)
 
-            pool = Pool(processes)
+            # Use 'fork' context to ensure child processes inherit Django setup.
+            # This is required for Python 3.14+ where the default start method is 'forkserver' on Linux.
+            ctx = multiprocessing.get_context('fork')
+            with ctx.Pool(processes) as pool:
+                tasks = []
+                for email_list in email_lists:
+                    tasks.append(pool.apply_async(_send_bulk, args=(email_list,)))
 
-            tasks = []
-            for email_list in email_lists:
-                tasks.append(pool.apply_async(_send_bulk, args=(email_list,)))
+                timeout = get_batch_delivery_timeout()
+                results = []
 
-            timeout = get_batch_delivery_timeout()
-            results = []
-
-            # Wait for all tasks to complete with a timeout
-            # The get method is used with a timeout to wait for each result
-            for task in tasks:
-                results.append(task.get(timeout=timeout))
-            # for task in tasks:
-            #     try:
-            #         # Wait for all tasks to complete with a timeout
-            #         # The get method is used with a timeout to wait for each result
-            #         results.append(task.get(timeout=timeout))
-            #     except (TimeoutError, ContextTimeoutError):
-            #         logger.exception("Process timed out after %d seconds" % timeout)
-
-            # results = pool.map(_send_bulk, email_lists)
-            pool.terminate()
-            pool.join()
+                # Wait for all tasks to complete with a timeout
+                # The get method is used with a timeout to wait for each result
+                for task in tasks:
+                    results.append(task.get(timeout=timeout))
 
             total_sent = sum(result[0] for result in results)
             total_failed = sum(result[1] for result in results)
-            total_requeued = [result[2] for result in results]
+            total_requeued = sum(result[2] for result in results)
 
     logger.info(
         '%s emails attempted, %s sent, %s failed, %s requeued',
@@ -333,7 +359,9 @@ def send_queued(processes=1, log_level=None):
     return total_sent, total_failed, total_requeued
 
 
-def _send_bulk(emails, uses_multiprocessing=True, log_level=None):
+def _send_bulk(
+    emails: Sequence[Email], uses_multiprocessing: bool = True, log_level: Optional[int] = None
+) -> tuple[int, int, int]:
     # Multiprocessing does not play well with database connection
     # Fix: Close connections on forking process
     # https://groups.google.com/forum/#!topic/django-users/eCAIY9DAfG0
@@ -342,21 +370,15 @@ def _send_bulk(emails, uses_multiprocessing=True, log_level=None):
 
     if log_level is None:
         log_level = get_log_level()
+    assert log_level is not None
 
     sent_emails = []
     failed_emails = []  # This is a list of two tuples (email, exception)
     email_count = len(emails)
 
-    logger.info('Process started, sending %s emails' % email_count)
+    logger.info(f'Process started, sending {email_count} emails')
 
-    def send(email):
-        try:
-            email.dispatch(log_level=log_level, commit=False, disconnect_after_delivery=False)
-            sent_emails.append(email)
-            logger.debug('Successfully sent email #%d' % email.id)
-        except Exception as e:
-            logger.exception('Failed to send email #%d' % email.id)
-            failed_emails.append((email, e))
+    emails_to_send = []
 
     # Prepare emails before we send these to threads for sending
     # So we don't need to access the DB from within threads
@@ -365,42 +387,37 @@ def _send_bulk(emails, uses_multiprocessing=True, log_level=None):
         # email from a faulty Django template
         try:
             email.prepare_email_message()
+            emails_to_send.append(email)
         except Exception as e:
-            logger.exception('Failed to prepare email #%d' % email.id)
+            logger.exception(f'Failed to prepare email #{email.id}')
             failed_emails.append((email, e))
 
     number_of_threads = min(get_threads_per_process(), email_count)
-    pool = ThreadPool(number_of_threads)
+    try:
+        with ThreadPool(number_of_threads) as pool:
+            results = []
+            for email in emails_to_send:
+                results.append((email, pool.apply_async(_send_email, args=(email, log_level))))
 
-    results = []
-    for email in emails:
-        results.append(pool.apply_async(send, args=(email,)))
+            timeout = get_batch_delivery_timeout()
 
-    timeout = get_batch_delivery_timeout()
-
-    # Wait for all tasks to complete with a timeout
-    # The get method is used with a timeout to wait for each result
-    for result in results:
-        result.get(timeout=timeout)
-    # for result in results:
-    #     try:
-    #         # Wait for all tasks to complete with a timeout
-    #         # The get method is used with a timeout to wait for each result
-    #         result.get(timeout=timeout)
-    #     except TimeoutError:
-    #         logger.exception("Process timed out after %d seconds" % timeout)
-
-    pool.close()
-    pool.join()
-
-    connections.close()
+            # Wait for all tasks to complete with a timeout
+            # The get method is used with a timeout to wait for each result
+            for email, result in results:
+                success, exception = result.get(timeout=timeout)
+                if success:
+                    sent_emails.append(email)
+                else:
+                    failed_emails.append((email, exception))
+    finally:
+        connections.close()
 
     Email = load_model('post_office', 'Email')
     Log = load_model('post_office', 'Log')
 
     # Update statuses of sent emails
     email_ids = [email.id for email in sent_emails]
-    Email.objects.filter(id__in=email_ids).update(status=STATUS.sent)
+    Email.objects.filter(id__in=email_ids).update(status=STATUS.sent, last_updated=timezone.now())
 
     # Update statuses and conditionally requeue failed emails
     num_failed, num_requeued = 0, 0
@@ -419,8 +436,9 @@ def _send_bulk(emails, uses_multiprocessing=True, log_level=None):
         else:
             email.status = STATUS.failed
             num_failed += 1
+        email.last_updated = timezone.now()
 
-    Email.objects.bulk_update(emails_failed, ['status', 'scheduled_time', 'number_of_retries'])
+    Email.objects.bulk_update(emails_failed, ['status', 'scheduled_time', 'number_of_retries', 'last_updated'])
 
     # If log level is 0, log nothing, 1 logs only sending failures
     # and 2 means log both successes and failures
@@ -458,7 +476,9 @@ def _send_bulk(emails, uses_multiprocessing=True, log_level=None):
     return len(sent_emails), num_failed, num_requeued
 
 
-def send_queued_mail_until_done(lockfile=default_lockfile, processes=1, log_level=None):
+def send_queued_mail_until_done(
+    lockfile: str = default_lockfile, processes: int = 1, log_level: Optional[int] = None
+) -> None:
     """
     Send mail in queue batch by batch, until all emails have been processed.
     """
@@ -469,6 +489,7 @@ def send_queued_mail_until_done(lockfile=default_lockfile, processes=1, log_leve
                 try:
                     send_queued(processes, log_level)
                 except Exception as e:
+                    connections.close()
                     logger.exception(e, extra={'status_code': 500})
                     raise
 

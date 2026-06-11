@@ -9,13 +9,28 @@ from django.conf import settings
 from django.core import mail
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
-from django.test import TestCase
+from django.test import TransactionTestCase
 from django.test.utils import override_settings
 from django.utils import timezone
 
-from ..mail import _send_bulk, create, get_queued, send, send_many, send_queued
-from ..models import PRIORITY, STATUS, Attachment, Email, EmailTemplate
-from ..settings import get_batch_size, get_log_level, get_max_retries, get_retry_timedelta, get_threads_per_process
+from post_office.mail import (
+    _send_bulk,
+    attach_templates,
+    create,
+    get_queued,
+    send,
+    send_many,
+    send_queued,
+    send_queued_mail_until_done,
+)
+from post_office.models import PRIORITY, STATUS, Attachment, Email, EmailTemplate
+from post_office.settings import (
+    get_batch_size,
+    get_log_level,
+    get_max_retries,
+    get_retry_timedelta,
+    get_threads_per_process,
+)
 
 connection_counter = 0
 
@@ -35,14 +50,14 @@ class ConnectionTestingBackend(mail.backends.base.BaseEmailBackend):
 
 class SlowTestBackend(mail.backends.base.BaseEmailBackend):
     """
-    An EmailBackend that sleeps for 10 seconds when sending messages
+    An EmailBackend that sleeps for 5 seconds when sending messages
     """
 
     def send_messages(self, email_messages):
         time.sleep(5)
 
 
-class MailTest(TestCase):
+class MailTest(TransactionTestCase):
     @override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
     def test_send_queued_mail(self):
         """
@@ -96,36 +111,67 @@ class MailTest(TestCase):
             status=STATUS.queued,
             backend_alias='locmem',
         )
+        original_last_updated = email.last_updated
+
         _send_bulk([email], uses_multiprocessing=False)
-        self.assertEqual(Email.objects.get(id=email.id).status, STATUS.sent)
+        email.refresh_from_db()
+        self.assertEqual(email.status, STATUS.sent)
+        self.assertGreater(email.last_updated, original_last_updated)
         self.assertEqual(len(mail.outbox), 1)
         self.assertEqual(mail.outbox[0].subject, 'send bulk')
 
-    @override_settings(EMAIL_BACKEND='post_office.tests.test_mail.ConnectionTestingBackend')
-    def test_send_bulk_reuses_open_connection(self):
-        """
-        Ensure _send_bulk() only opens connection once to send multiple emails.
-        """
-        global connection_counter
-        self.assertEqual(connection_counter, 0)
+        # test fail
         email = Email.objects.create(
             to=['to@example.com'],
             from_email='bob@example.com',
-            subject='',
-            message='',
+            subject='send bulk',
+            message='Message',
             status=STATUS.queued,
-            backend_alias='connection_tester',
+            backend_alias='locmem',
         )
-        email_2 = Email.objects.create(
-            to=['to@example.com'],
-            from_email='bob@example.com',
-            subject='',
-            message='',
-            status=STATUS.queued,
-            backend_alias='connection_tester',
+        original_last_updated = email.last_updated
+        with patch.object(Email, 'dispatch', side_effect=ValueError('test')):
+            _send_bulk([email], uses_multiprocessing=False)
+
+        email.refresh_from_db()
+        self.assertEqual(email.status, STATUS.requeued)
+        self.assertEqual(email.number_of_retries, 1)
+        self.assertGreater(email.last_updated, original_last_updated)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].subject, 'send bulk')
+
+    @override_settings(
+        EMAIL_BACKEND='tests.test_mail.ConnectionTestingBackend',
+        POST_OFFICE={
+            'BACKENDS': {
+                'connection_tester': 'tests.test_mail.ConnectionTestingBackend',
+            },
+            'THREADS_PER_PROCESS': 1,
+        },
+    )
+    def test_send_bulk_reuses_open_connection(self):
+        """
+        Ensure _send_bulk() opens one connection per thread, not one per email.
+        With THREADS_PER_PROCESS=1: main thread opens one during prepare, worker
+        thread opens one during send — total 2 opens for any number of emails.
+        """
+        global connection_counter
+        self.assertEqual(connection_counter, 0)
+        email_1, email_2, email_3 = Email.objects.bulk_create(
+            [
+                Email(
+                    to=['to@example.com'],
+                    from_email='bob@example.com',
+                    subject='',
+                    message='',
+                    status=STATUS.queued,
+                    backend_alias='connection_tester',
+                )
+                for _ in range(3)
+            ]
         )
-        _send_bulk([email, email_2])
-        self.assertEqual(connection_counter, 1)
+        _send_bulk([email_1, email_2, email_3])
+        self.assertEqual(connection_counter, 2)
 
     def test_get_queued(self):
         """
@@ -159,6 +205,27 @@ class MailTest(TestCase):
             status=STATUS.queued, scheduled_time=timezone.datetime(2010, 12, 13), **kwargs
         )
         self.assertEqual(list(get_queued()), [queued_email, past_email])
+
+    def test_attach_templates(self):
+        """
+        Ensure templates are loaded efficiently when multiple emails share the same template.
+        """
+        template = EmailTemplate.objects.create(name='test', subject='Test', content='Test content')
+        # Create multiple emails with the same template
+        for _ in range(5):
+            template.email_set.create(
+                from_email='from@example.com',
+                to=['to@example.com'],
+                context={'name': 'Test'},
+                status=STATUS.queued,
+            )
+
+        emails = list(get_queued())
+        attach_templates(emails)
+
+        # All emails should reference the same template object instance
+        template_instances = [id(email.template) for email in emails]
+        self.assertEqual(len(set(template_instances)), 1)
 
     def test_get_batch_size(self):
         """
@@ -330,9 +397,9 @@ class MailTest(TestCase):
         email = create(sender='from@example.com', recipients=['to@example.com'], template=template, context=context)
         today = timezone.datetime.today()
         current_year = today.year
-        self.assertEqual(email.subject, 'Subject %d' % current_year)
-        self.assertEqual(email.message, 'Content %d' % current_year)
-        self.assertEqual(email.html_message, 'HTML %d' % current_year)
+        self.assertEqual(email.subject, f'Subject {current_year}')
+        self.assertEqual(email.message, f'Content {current_year}')
+        self.assertEqual(email.html_message, f'HTML {current_year}')
         self.assertEqual(email.context, None)
         self.assertIsNotNone(email.template)
 
@@ -521,7 +588,7 @@ class MailTest(TestCase):
         """
         Ensure that batch delivery timeout is respected.
         """
-        email = Email.objects.create(
+        _ = Email.objects.create(
             to=['to@example.com'],
             from_email='bob@example.com',
             subject='',
@@ -531,12 +598,45 @@ class MailTest(TestCase):
         )
         start_time = timezone.now()
         # slow backend sleeps for 5 seconds, so we should get a timeout error since we set
-        # BATCH_DELIVERY_TIMEOUT timeout to 2 seconds in test_settings.py
+        # BATCH_DELIVERY_TIMEOUT timeout to 2 seconds in this test
         with self.assertRaises(TimeoutError):
             send_queued()
         end_time = timezone.now()
         # Assert that running time is less than 3 seconds (2 seconds timeout + 1 second buffer)
         self.assertTrue(end_time - start_time < timezone.timedelta(seconds=3))
+
+    def test_send_bulk_closes_connections_on_exception(self):
+        """
+        Connections must be released even when _send_bulk raises (e.g. on batch
+        delivery timeout or any other pool-side failure). Otherwise the
+        backend's HTTP session leaks sockets across repeated batches and
+        eventually hits EMFILE (too many open files).
+        """
+        email = Email.objects.create(
+            to=['to@example.com'],
+            from_email='bob@example.com',
+            subject='',
+            message='',
+            status=STATUS.queued,
+            backend_alias='locmem',
+        )
+        # Simulate any exception raised from the pool block (timeout, crash, etc.)
+        with patch('post_office.mail.ThreadPool', side_effect=RuntimeError('pool broke')):
+            with patch('post_office.mail.connections.close') as mock_close:
+                with self.assertRaises(RuntimeError):
+                    _send_bulk([email], uses_multiprocessing=False)
+                mock_close.assert_called()
+
+    def test_send_queued_mail_until_done_closes_connections_on_error(self):
+        """
+        send_queued_mail_until_done must close connections before re-raising,
+        so a crashing batch doesn't leave an open backend session behind.
+        """
+        with patch('post_office.mail.send_queued', side_effect=RuntimeError('boom')):
+            with patch('post_office.mail.connections.close') as mock_close:
+                with self.assertRaises(RuntimeError):
+                    send_queued_mail_until_done(lockfile='/tmp/post_office_test_lockfile')
+                mock_close.assert_called()
 
     @patch('post_office.signals.email_queued.send')
     def test_backend_signal(self, mock):

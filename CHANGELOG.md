@@ -1,6 +1,33 @@
 Changelog
 =========
 
+## Version 3.11.2 (2026-04-16)
+* `_send_email` should dispatch email using it's own connection. Thanks @ibadarrohman!
+
+## Version 3.11.1 (2026-04-15)
+* Fixed a bug where `connections.close()` is not called when exceptions are raised. Thanks @selwin!
+* Fixed a bug where `connections.close()` does not clear connections cache. Thanks @selwin!
+
+## Version 3.11 (2026-01-04)
+* Added Python 3.14 and Django 6.0 compatibility. Thanks @selwin!
+* Replaced `bleach` with `nh3` for HTML sanitization. `bleach` has been deprecated since 2023. Thanks @selwin!
+* Added `SESWebhookHandler` and `SparkPostWebhookHandler` for handling webhook events (beta feature). Thanks @selwin!
+* Optimized the way templates are fetched during email delivery. Thanks @selwin!
+
+Version 3.10.1 (2025-08-04)
+---------------------------
+* Fixed an issue where `email.last_updated` is not updated during email delivery. Thanks @marsha97!
+
+Version 3.10.0 (2025-07-15)
+---------------------------
+* Added `email.recipient_delivery_status` field for tracking delivery issues. Thanks @hery733!
+* Added `FILE_STORAGE` option in `POST_OFFICE` config to specify the storage backend for attachments. Thanks @blag!
+* Added Czech translation. Thanks @fdobrovolny!
+* Lots of packaging work and converted setup.py to pyproject.toml. Thanks @blag!
+* Various admin improvements. Thanks @blag!
+* Updated tests and translations. Thanks @samiashi!
+* `mail.send_many()` now returns a list of `Email` instances. Thanks @chromium7!
+
 Version 3.9.0 (2024-06-19)
 --------------------------
 * Added a new `LOCK_FILE_NAME` which lets you change post office's lock file name. Thanks @mogost!
@@ -81,7 +108,7 @@ Version 3.4.1 (2020-05-16)
 --------------------------
 * Allow `tasks.py` to be imported when Celery is not installed. This allows
   auto-discovery by other task systems such as Huey to succeed.
-* Fix duplicate key problem in template editor in Django admin. 
+* Fix duplicate key problem in template editor in Django admin.
 
 Version 3.4.0 (2020-04-13)
 --------------------------

@@ -1,17 +1,14 @@
 import os
-import platform
-
-if platform.system() in ['Darwin']:
-    from multiprocessing import set_start_method
-
-    # required since Python-3.8. See #319
-    set_start_method('fork')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': os.path.join(BASE_DIR, 'test_db.sqlite3'),
+        'OPTIONS': {
+            'timeout': 30,
+        },
     },
 }
 
@@ -37,16 +34,26 @@ POST_OFFICE = {
     'BACKENDS': {
         'default': 'django.core.mail.backends.dummy.EmailBackend',
         'locmem': 'django.core.mail.backends.locmem.EmailBackend',
-        'error': 'post_office.tests.test_backends.ErrorRaisingBackend',
+        'error': 'tests.test_backends.ErrorRaisingBackend',
         'smtp': 'django.core.mail.backends.smtp.EmailBackend',
-        'connection_tester': 'post_office.tests.test_mail.ConnectionTestingBackend',
-        'slow_backend': 'post_office.tests.test_mail.SlowTestBackend',
+        'connection_tester': 'tests.test_mail.ConnectionTestingBackend',
+        'slow_backend': 'tests.test_mail.SlowTestBackend',
     },
     'CELERY_ENABLED': False,
     'MAX_RETRIES': 2,
     'MESSAGE_ID_ENABLED': True,
     'BATCH_DELIVERY_TIMEOUT': 2,
     'MESSAGE_ID_FQDN': 'example.com',
+    'WEBHOOKS': {
+        'SES': {
+            'VERIFY_SIGNATURE': True,
+        },
+        'SPARKPOST': {
+            'USERNAME': 'test-user',
+            'PASSWORD': 'test-password',
+            'VERIFY_SIGNATURE': True,
+        },
+    },
 }
 
 
@@ -61,7 +68,7 @@ INSTALLED_APPS = (
 
 SECRET_KEY = 'a'
 
-ROOT_URLCONF = 'post_office.test_urls'
+ROOT_URLCONF = 'tests.test_urls'
 
 DEFAULT_FROM_EMAIL = 'webmaster@example.com'
 
@@ -92,7 +99,7 @@ TEMPLATES = [
     {
         'BACKEND': 'post_office.template.backends.post_office.PostOfficeTemplates',
         'APP_DIRS': True,
-        'DIRS': [os.path.join(BASE_DIR, 'tests/templates')],
+        'DIRS': [os.path.join(BASE_DIR, 'templates')],
         'OPTIONS': {
             'context_processors': [
                 'django.contrib.auth.context_processors.auth',
@@ -107,6 +114,6 @@ TEMPLATES = [
     },
 ]
 
-STATICFILES_DIRS = [os.path.join(BASE_DIR, 'tests/static')]
+STATICFILES_DIRS = [os.path.join(BASE_DIR, 'static')]
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'

@@ -17,13 +17,8 @@ Django. Some awesome features are:
 
 ## Dependencies
 
--   [django \>= 2.2](https://djangoproject.com/)
--   [jsonfield](https://github.com/rpkilby/jsonfield)
--   [bleach](https://bleach.readthedocs.io/)
-
-With this optional dependency, HTML emails are nicely rendered
-inside the Django admin backend. Without this library, all HTML tags
-will otherwise be stripped for security reasons.
+-   [django \>= 4.2](https://djangoproject.com/)
+-   [nh3](https://nh3.readthedocs.io/) - HTML sanitization library for rendering HTML emails safely in Django admin
 
 ## Installation
 
@@ -95,7 +90,9 @@ too much. To actually send them out, run
 `python manage.py send_queued_mail`. You can schedule this management
 command to run regularly via cron:
 
-    * * * * * (/usr/bin/python manage.py send_queued_mail >> send_mail.log 2>&1)
+```cron
+* * * * * (/usr/bin/python manage.py send_queued_mail >> send_mail.log 2>&1)
+```
 
 ## Usage
 
@@ -290,7 +287,7 @@ POST_OFFICE = {
 
 In templates used to render HTML for emails add
 
-```
+```html+django
 {% load post_office %}
 
 <p>... somewhere in the body ...</p>
@@ -400,14 +397,163 @@ mail.send(
 
 You may want to set these up via cron to run regularly:
 
-    * * * * * (cd $PROJECT; python manage.py send_queued_mail --processes=1 >> $PROJECT/cron_mail.log 2>&1)
-    0 1 * * * (cd $PROJECT; python manage.py cleanup_mail --days=30 --delete-attachments >> $PROJECT/cron_mail_cleanup.log 2>&1)
+```cron
+* * * * * (cd $PROJECT; python manage.py send_queued_mail --processes=1 >> $PROJECT/cron_mail.log 2>&1)
+0 1 * * * (cd $PROJECT; python manage.py cleanup_mail --days=30 --delete-attachments >> $PROJECT/cron_mail_cleanup.log 2>&1)
+```
 
 
 ## Settings
 
 This section outlines all the settings and configurations that you can
 put in Django's `settings.py` to fine tune `post-office`'s behavior.
+
+### Webhook Handlers (Not Yet Released)
+
+__Webhook Handlers are still in beta, use at your own risk.__
+
+`post_office` ships with webhook handlers for AWS SES and SparkPost. These handlers
+parse ESP (Email Service Provider) webhook payloads into normalized `ESPEvent` objects
+and call `handle_events()` so you can implement your own persistence logic.
+
+```python
+from post_office.webhooks import SESWebhookHandler, SparkPostWebhookHandler, ESPEvent
+```
+
+#### ESPEvent
+
+Each webhook event is normalized into an `ESPEvent` object:
+
+```python
+ESPEvent(
+    raw_event='delivered',                 # raw ESP event name
+    delivery_status=RecipientDeliveryStatus.DELIVERED,
+    recipient='user@example.com',          # recipient email
+    message_id='<abc123@example.com>',     # message-id header or provider id
+    timestamp=timezone.now(),              # datetime if available
+    subject='Hello',                       # subject if provided
+    to_addresses=['a@example.com'],        # all recipients if provided
+)
+```
+
+The `delivery_status` field uses `RecipientDeliveryStatus` with the following values:
+
+- `ACCEPTED`
+- `DELIVERED`
+- `OPENED`
+- `CLICKED`
+- `DEFERRED`
+- `SOFT_BOUNCED`
+- `UNDETERMINED_BOUNCED`
+- `HARD_BOUNCED`
+- `SPAM_COMPLAINT`
+- `UNSUBSCRIBED`
+
+#### SESWebhookHandler
+
+Handles AWS SES notifications via SNS. Supports delivery, bounce (soft/hard/undetermined),
+and complaint events.
+
+```python
+from django.urls import path
+from post_office.webhooks import SESWebhookHandler, ESPEvent
+
+
+class MySESWebhookHandler(SESWebhookHandler):
+    def handle_events(self, events: list[ESPEvent], payload):
+        for event in events:
+            # Add your own persistence logic here.
+            # Example: update Email by message_id or subject.
+            pass
+
+
+urlpatterns = [
+    path('webhooks/ses/', MySESWebhookHandler.as_view(), name='ses-webhook'),
+]
+```
+
+Configure in `POST_OFFICE`:
+
+```python
+POST_OFFICE = {
+    'WEBHOOKS': {
+        'SES': {
+            'VERIFY_SIGNATURE': True,  # default, requires cryptography package
+        },
+    },
+}
+```
+
+Signature verification uses the SNS `SigningCertURL` and requires the `cryptography`
+package. Set `VERIFY_SIGNATURE` to `False` for local development only.
+
+The handler also recognizes SNS subscription confirmations; visit the `SubscribeURL`
+from AWS to complete the subscription.
+
+#### SparkPostWebhookHandler
+
+Handles SparkPost webhook events including delivery, bounce, open, click, spam complaint,
+and unsubscribe events.
+
+```python
+from django.urls import path
+from post_office.webhooks import SparkPostWebhookHandler, ESPEvent
+
+
+class MySparkPostWebhookHandler(SparkPostWebhookHandler):
+    def handle_events(self, events: list[ESPEvent], payload):
+        for event in events:
+            # Add your own persistence logic here.
+            pass
+
+
+urlpatterns = [
+    path('webhooks/sparkpost/', MySparkPostWebhookHandler.as_view(), name='sparkpost-webhook'),
+]
+```
+
+Configure in `POST_OFFICE`:
+
+```python
+POST_OFFICE = {
+    'WEBHOOKS': {
+        'SPARKPOST': {
+            'USERNAME': 'your-webhook-username',
+            'PASSWORD': 'your-webhook-password',
+            'VERIFY_SIGNATURE': True,  # default
+        },
+    },
+}
+```
+
+SparkPost uses HTTP Basic Authentication. Configure `USERNAME` and `PASSWORD` to match
+your SparkPost webhook settings.
+
+
+### File Storage
+
+If you want Post Office to use a specific file storage for attachments, make sure to configure a
+storage in the `STORAGES` setting in your project `settings.py`, then specify the storage name in
+the `FILE_STORAGE` key. Post Office will use the `default` storage if this is not specified.
+
+```python
+STORAGES = {
+    "default": {
+        "BACKEND": 'django.core.files.storage.FileSystemStorage',
+    },
+    "staticfiles": {
+        "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+    },
+    "post_office": {
+        "BACKEND": 'storages.backends.s3boto3.S3Boto3Storage',
+    },
+}
+
+POST_OFFICE = {
+    ...
+    'FILE_STORAGE': 'post_office',
+}
+```
 
 
 ### Batch Size
@@ -692,20 +838,21 @@ Attachments are not supported with `mail.send_many()`.
 
 To run the test suite:
 
-```python
-`which django-admin` test post_office --settings=post_office.test_settings --pythonpath=.
+```sh
+pip install -e ".[test]"
+pytest
 ```
 
 You can run the full test suite for all supported versions of Django and Python with:
 
-```python
+```sh
 tox
 ```
 
 or:
 
-```python
-python setup.py test
+```sh
+pytest
 ```
 
 
@@ -818,8 +965,7 @@ containers, where you don't have a running cron-daemon.
 ## Signals
 
 Each time an email is added to the mail queue, Post Office emits a
-special [Django
-signal](https://docs.djangoproject.com/en/stable/topics/signals/).
+special [Django signal](https://docs.djangoproject.com/en/stable/topics/signals/).
 Whenever a third party application wants to be informed about this
 event, it shall connect a callback function to the Post Office's signal
 handler `email_queued`, for instance:
@@ -841,5 +987,4 @@ handler.
 
 Full changelog can be found [here](https://github.com/ui/django-post_office/blob/master/CHANGELOG.md).
 
-Created and maintained by the cool guys at [Stamps](https://stamps.co.id), Indonesia's most elegant
-CRM/loyalty platform.
+Created and maintained by [Stamps](https://stamps.id), Indonesia's most elegant CRM/loyalty platform.
