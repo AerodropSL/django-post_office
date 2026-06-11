@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import connection as db_connection
+from django.db import connection as db_connection, transaction
 from django.db.models import Q, QuerySet
 from django.template import Context, Template
 from django.utils import timezone
@@ -216,29 +216,30 @@ def send(
     if backend and backend not in get_available_backends().keys():
         raise ValueError(f'{backend} is not a valid backend alias')
 
-    email = create(
-        sender,
-        recipients,
-        cc,
-        bcc,
-        subject,
-        message,
-        html_message,
-        context,
-        scheduled_time,
-        expires_at,
-        headers,
-        template,
-        priority,
-        render_on_delivery,
-        commit=commit,
-        backend=backend,
-        **kwargs,
-    )
+    with transaction.atomic():
+        email = create(
+            sender,
+            recipients,
+            cc,
+            bcc,
+            subject,
+            message,
+            html_message,
+            context,
+            scheduled_time,
+            expires_at,
+            headers,
+            template,
+            priority,
+            render_on_delivery,
+            commit=commit,
+            backend=backend,
+            **kwargs,
+        )
 
-    if attachments:
-        attachments = create_attachments(attachments)
-        email.attachments.add(*attachments)
+        if attachments:
+            attachments = create_attachments(attachments)
+            email.attachments.add(*attachments)
 
     if priority == PRIORITY.now:
         email.dispatch(log_level=log_level)

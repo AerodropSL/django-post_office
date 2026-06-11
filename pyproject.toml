@@ -36,6 +36,7 @@ classifiers = [
 dependencies = [
     "nh3",
     "django>=4.2",
+    'swapper',
 ]
 dynamic = ["version"]
 

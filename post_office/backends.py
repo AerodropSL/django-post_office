@@ -1,7 +1,9 @@
 from collections import OrderedDict
 from email.mime.base import MIMEBase
+from swapper import load_model
 from django.core.files.base import ContentFile
 from django.core.mail.backends.base import BaseEmailBackend
+from django.db import transaction
 from .settings import get_default_priority
 
 
@@ -18,9 +20,11 @@ class EmailBackend(BaseEmailBackend):
         email messages sent.
         """
         from .mail import create
-        from .models import STATUS, Email
+        from .models import STATUS
         from .utils import create_attachments
         from .signals import email_queued
+
+        Email = load_model('post_office', 'Email')
 
         if not email_messages:
             return
@@ -53,21 +57,22 @@ class EmailBackend(BaseEmailBackend):
                 else:
                     attachment_files[attachment[0]] = ContentFile(attachment[1])
 
-            email = create(
-                sender=from_email,
-                recipients=email_message.to,
-                cc=email_message.cc,
-                bcc=email_message.bcc,
-                subject=subject,
-                message=message,
-                html_message=html_body,
-                headers=headers,
-            )
+            with transaction.atomic():
+                email = create(
+                    sender=from_email,
+                    recipients=email_message.to,
+                    cc=email_message.cc,
+                    bcc=email_message.bcc,
+                    subject=subject,
+                    message=message,
+                    html_message=html_body,
+                    headers=headers,
+                )
 
-            if attachment_files:
-                attachments = create_attachments(attachment_files)
+                if attachment_files:
+                    attachments = create_attachments(attachment_files)
 
-                email.attachments.add(*attachments)
+                    email.attachments.add(*attachments)
 
             emails.append(email)
 
