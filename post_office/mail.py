@@ -43,7 +43,7 @@ logger = setup_loghandlers('INFO')
 
 def _send_email(email: Email, log_level: int) -> tuple[bool, Optional[Exception]]:
     try:
-        connection = connections[email.backend_alias or 'default']
+        connection = connections.get(email.backend_alias or 'default')
         email.dispatch(log_level=log_level, commit=False, disconnect_after_delivery=False, connection=connection)
         logger.debug(f'Successfully sent email #{email.id}')
         return True, None

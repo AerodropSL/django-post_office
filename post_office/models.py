@@ -122,7 +122,7 @@ class AbstractEmail(models.Model):
         return self.prepare_email_message()
 
     def get_connection(self):
-        return connections[self.backend_alias or 'default']
+        return connections.get(self.backend_alias or 'default')
 
     def prepare_email_message(self):
         """
