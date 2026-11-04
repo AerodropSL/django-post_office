@@ -2,6 +2,7 @@ import multiprocessing
 import os
 import re
 import tempfile
+import threading
 import time
 from datetime import timedelta
 from unittest.mock import MagicMock, Mock, patch
@@ -159,7 +160,9 @@ class MailTest(TransactionTestCase):
     def test_send_bulk_reuses_open_connection(self):
         """
         Ensure _send_bulk() opens one connection per thread, not one per email.
-        Preparing opens nothing, so THREADS_PER_PROCESS=1 means one open total.
+        Preparing resolves the connection once in the main thread (see
+        test_send_bulk_resolves_connection_in_main_thread), and THREADS_PER_PROCESS=1
+        adds one worker connection: two opens total.
         """
         global connection_counter
         self.assertEqual(connection_counter, 0)
@@ -177,7 +180,34 @@ class MailTest(TransactionTestCase):
             ]
         )
         _send_bulk([email_1, email_2, email_3])
-        self.assertEqual(connection_counter, 1)
+        self.assertEqual(connection_counter, 2)
+
+    def test_send_bulk_resolves_connection_in_main_thread(self):
+        """
+        get_connection() overrides on a swapped Email model may read the DB (e.g. a
+        related company). _send_bulk() must call it in the main thread before the
+        worker threads, whose fresh DB connections can't see uncommitted rows or
+        the active tenant schema.
+        """
+        email = Email.objects.create(
+            to=['to@example.com'],
+            from_email='bob@example.com',
+            status=STATUS.queued,
+            backend_alias='locmem',
+        )
+        main_thread = threading.get_ident()
+        calling_threads = []
+        original_get_connection = Email.get_connection
+
+        def get_connection(self):
+            calling_threads.append(threading.get_ident())
+            return original_get_connection(self)
+
+        with patch.object(Email, 'get_connection', get_connection):
+            _send_bulk([email], uses_multiprocessing=False)
+
+        self.assertEqual(calling_threads[0], main_thread)
+        self.assertEqual(len(mail.outbox), 1)
 
     @override_settings(
         EMAIL_BACKEND='tests.test_mail.ConnectionTestingBackend',

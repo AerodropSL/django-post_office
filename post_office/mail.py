@@ -408,6 +408,10 @@ def _send_bulk(
         # email from a faulty Django template
         try:
             email.prepare_email_message()
+            # Also resolve the connection here: get_connection() overrides may read
+            # the DB (e.g. a related company), which worker threads must not do.
+            # Their fresh DB connections can't see uncommitted rows or the tenant schema.
+            email.get_connection()
             emails_to_send.append(email)
         except Exception as e:
             logger.exception(f'Failed to prepare email #{email.id}')
