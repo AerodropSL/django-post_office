@@ -1,8 +1,9 @@
 import multiprocessing
+import time
 from collections.abc import Sequence
 from email.utils import make_msgid
 from multiprocessing.dummy import Pool as ThreadPool
-from typing import Any, Optional
+from typing import Any
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -18,7 +19,7 @@ from .lockfile import FileLock, FileLocked, default_lockfile
 from .logutils import setup_loghandlers
 from .models import PRIORITY, STATUS, Email, EmailTemplate, Log
 from .settings import (
-    get_available_backends,
+    get_backend_aliases,
     get_batch_delivery_timeout,
     get_batch_size,
     get_log_level,
@@ -40,16 +41,8 @@ from .utils import (
 
 logger = setup_loghandlers('INFO')
 
-
-def _send_email(email: Email, log_level: int) -> tuple[bool, Optional[Exception]]:
-    try:
-        connection = email.get_connection()
-        email.dispatch(log_level=log_level, commit=False, disconnect_after_delivery=False, connection=connection)
-        logger.debug(f'Successfully sent email #{email.id}')
-        return True, None
-    except Exception as e:
-        logger.exception(f'Failed to send email #{email.id}')
-        return False, e
+# Extra time (seconds) the parent gives workers to finish writing statuses after their own deadline.
+WORKER_COMPLETION_GRACE_PERIOD = 30
 
 
 def create(
@@ -85,6 +78,7 @@ def create(
         cc = []
     if bcc is None:
         bcc = []
+    has_context = context is not None
     if context is None:
         context = ''
     message_id = make_msgid(domain=get_message_id_fqdn()) if get_message_id_enabled() else None
@@ -115,10 +109,12 @@ def create(
             message = template.content
             html_message = template.html_content
 
-        _context = Context(context or {})
-        subject = Template(subject).render(_context)
-        message = Template(message).render(_context)
-        html_message = Template(html_message).render(_context)
+        # Like Django's send_mail(), text is only rendered as a template when templating is requested (#478).
+        if template or has_context:
+            _context = Context(context or {})
+            subject = Template(subject).render(_context)
+            message = Template(message).render(_context)
+            html_message = Template(html_message).render(_context)
 
         email = Email(
             from_email=sender,
@@ -213,7 +209,7 @@ def send(
         else:
             template = get_email_template(template, language)
 
-    if backend and backend not in get_available_backends().keys():
+    if backend and backend not in get_backend_aliases():
         raise ValueError(f'{backend} is not a valid backend alias')
 
     with transaction.atomic():
@@ -301,7 +297,7 @@ def attach_templates(emails: list[Email]) -> None:
             email.template = template_map.get(email.template_id)
 
 
-def send_queued(processes: int = 1, log_level: Optional[int] = None) -> tuple[int, int, int]:
+def send_queued(processes: int = 1, log_level: int | None = None) -> tuple[int, int, int]:
     """
     Sends out all queued mails that has scheduled_time less than now or None
     """
@@ -332,22 +328,46 @@ def send_queued(processes: int = 1, log_level: Optional[int] = None) -> tuple[in
             # Use 'fork' context to ensure child processes inherit Django setup.
             # This is required for Python 3.14+ where the default start method is 'forkserver' on Linux.
             ctx = multiprocessing.get_context('fork')
+            # Workers enforce their own deadline in _send_bulk; the parent only waits a bit longer.
+            parent_timeout = get_batch_delivery_timeout() + WORKER_COMPLETION_GRACE_PERIOD
+            parent_deadline = time.monotonic() + parent_timeout
+            results = []
+            timed_out_workers = []
+
             with ctx.Pool(processes) as pool:
                 tasks = []
                 for email_list in email_lists:
                     tasks.append(pool.apply_async(_send_bulk, args=(email_list,)))
 
-                timeout = get_batch_delivery_timeout()
-                results = []
-
-                # Wait for all tasks to complete with a timeout
-                # The get method is used with a timeout to wait for each result
-                for task in tasks:
-                    results.append(task.get(timeout=timeout))
+                for index, task in enumerate(tasks):
+                    remaining = max(0, parent_deadline - time.monotonic())
+                    try:
+                        results.append(task.get(timeout=remaining))
+                    except multiprocessing.TimeoutError:
+                        timed_out_workers.append(index)
+                        logger.warning(
+                            'Worker %s did not return within %s seconds; its emails are excluded from the totals below',
+                            index,
+                            parent_timeout,
+                        )
 
             total_sent = sum(result[0] for result in results)
             total_failed = sum(result[1] for result in results)
             total_requeued = sum(result[2] for result in results)
+
+            if timed_out_workers:
+                # Raise so send_queued_mail_until_done() stops instead of re-selecting the stuck emails.
+                logger.warning(
+                    'Partial totals from %s of %s workers: %s sent, %s failed, %s requeued',
+                    len(results),
+                    len(tasks),
+                    total_sent,
+                    total_failed,
+                    total_requeued,
+                )
+                raise multiprocessing.TimeoutError(
+                    f'Workers {timed_out_workers} did not return within {parent_timeout} seconds'
+                )
 
     logger.info(
         '%s emails attempted, %s sent, %s failed, %s requeued',
@@ -361,7 +381,7 @@ def send_queued(processes: int = 1, log_level: Optional[int] = None) -> tuple[in
 
 
 def _send_bulk(
-    emails: Sequence[Email], uses_multiprocessing: bool = True, log_level: Optional[int] = None
+    emails: Sequence[Email], uses_multiprocessing: bool = True, log_level: int | None = None
 ) -> tuple[int, int, int]:
     # Multiprocessing does not play well with database connection
     # Fix: Close connections on forking process
@@ -388,29 +408,68 @@ def _send_bulk(
         # email from a faulty Django template
         try:
             email.prepare_email_message()
+            # Also resolve the connection here: get_connection() overrides may read
+            # the DB (e.g. a related company), which worker threads must not do.
+            # Their fresh DB connections can't see uncommitted rows or the tenant schema.
+            email.get_connection()
             emails_to_send.append(email)
         except Exception as e:
             logger.exception(f'Failed to prepare email #{email.id}')
             failed_emails.append((email, e))
+
+    # The ThreadPool workers open their own connections lazily and reuse them
+    # for every mail they handle. However, those connections cannot be closed by
+    # the main thread's connections.close(). So we collect them and explicitly
+    # close them once all threads have finished.
+    opened_connections = set()
+
+    def _send_email(email):
+        try:
+            connection = email.get_connection()
+            opened_connections.add(connection)
+            email.dispatch(
+                log_level=log_level,
+                commit=False,
+                disconnect_after_delivery=False,
+                connection=connection,
+            )
+            logger.debug(f'Successfully sent email #{email.id}')
+            return True, None
+        except Exception as e:
+            logger.exception(f'Failed to send email #{email.id}')
+            return False, e
 
     number_of_threads = min(get_threads_per_process(), email_count)
     try:
         with ThreadPool(number_of_threads) as pool:
             results = []
             for email in emails_to_send:
-                results.append((email, pool.apply_async(_send_email, args=(email, log_level))))
+                results.append((email, pool.apply_async(_send_email, args=(email,))))
 
+            # One deadline for all result waits; each get() only waits for the time remaining.
             timeout = get_batch_delivery_timeout()
+            deadline = time.monotonic() + timeout
 
-            # Wait for all tasks to complete with a timeout
-            # The get method is used with a timeout to wait for each result
             for email, result in results:
-                success, exception = result.get(timeout=timeout)
+                remaining = max(0, deadline - time.monotonic())
+                try:
+                    success, exception = result.get(timeout=remaining)
+                except multiprocessing.TimeoutError as e:
+                    logger.warning('Email #%d timed out: batch exceeded %s seconds', email.id, timeout)
+                    success, exception = False, e
                 if success:
                     sent_emails.append(email)
                 else:
                     failed_emails.append((email, exception))
     finally:
+        # Close the connections opened inside the worker threads.
+        for connection in opened_connections:
+            try:
+                connection.close()
+            except Exception:
+                logger.exception('Failed to close email connection')
+        opened_connections.clear()
+        # Close any connection opened in the main thread.
         connections.close()
 
     Email = load_model('post_office', 'Email')
@@ -478,7 +537,7 @@ def _send_bulk(
 
 
 def send_queued_mail_until_done(
-    lockfile: str = default_lockfile, processes: int = 1, log_level: Optional[int] = None
+    lockfile: str = default_lockfile, processes: int = 1, log_level: int | None = None
 ) -> None:
     """
     Send mail in queue batch by batch, until all emails have been processed.
